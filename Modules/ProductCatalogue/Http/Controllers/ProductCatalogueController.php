@@ -39,9 +39,10 @@ class ProductCatalogueController extends Controller
      *
      * @return Response
      */
+    
     public function index($business_id, $location_id)
     {
-        $products = Product::where('business_id', $business_id)
+        $products = Product::where('business_id', $business_id)->where('not_for_selling',0)
             ->whereHas('product_locations', function ($q) use ($location_id) {
                 $q->where('product_locations.location_id', $location_id);
             })

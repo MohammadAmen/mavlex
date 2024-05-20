@@ -186,8 +186,8 @@
                                 <span class="input-group-addon">
                                     <i class="fa fa-user"></i>
                                 </span>
-                                <input type="hidden" id="default_customer_id" value="{{ $walk_in_customer['id'] }}">
-                                <input type="hidden" id="default_customer_name" value="{{ $walk_in_customer['name'] }}">
+                                <input type="hidden" id="default_customer_id" value="{{ $walk_in_customer['id'] ?? '' }}">
+                                <input type="hidden" id="default_customer_name" value="{{ $walk_in_customer['name'] ?? '' }}">
                                 <input type="hidden" id="default_customer_balance"
                                     value="{{ $walk_in_customer['balance'] ?? '' }}">
                                 <input type="hidden" id="default_customer_address"
@@ -248,7 +248,7 @@
                             @lang('lang_v1.shipping_address'):
                         </strong>
                         <div id="shipping_address_div">
-                            {{ $walk_in_customer['supplier_business_name'] ?? '' }}@if ($walk_in_customer['supplier_business_name'])
+                            {{ $walk_in_customer['supplier_business_name'] ?? '' }}@if (isset($walk_in_customer['supplier_business_name']))
                                 ,<br>
                             @endif
                             {{ $walk_in_customer['name'] ?? '' }}
