@@ -381,6 +381,8 @@ class SellController extends Controller
                         //     }
                         // }
 
+
+                        $html .= '<li><a href="' . route('generate.xml') . '" target="_blank"><i class="fas fa-print" aria-hidden="true"></i> ' . "Export as XML" . '</a></li>';
                         if (config('constants.enable_download_pdf') && auth()->user()->can('print_invoice') && $sale_type != 'sales_order') {
                             $html .= '<li><a href="' . route('sell.downloadPdf', [$row->id]) . '" target="_blank"><i class="fas fa-print" aria-hidden="true"></i> ' . __('lang_v1.download_pdf') . '</a></li>';
 
@@ -887,7 +889,7 @@ class SellController extends Controller
         $users = config('constants.enable_contact_assign') ? User::forDropdown($business_id, false, false, false, true) : [];
 
         $change_return = $this->dummyPaymentLine;
-        
+
         return view('sell.create_fast')
             ->with(compact(
                 'business_details',

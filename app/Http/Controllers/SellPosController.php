@@ -63,6 +63,8 @@ use Stripe\Charge;
 use Stripe\Stripe;
 use Yajra\DataTables\Facades\DataTables;
 use App\Events\SellCreatedOrModified;
+use DOMDocument;
+use SimpleXMLElement;
 
 class SellPosController extends Controller
 {
@@ -322,334 +324,334 @@ class SellPosController extends Controller
         }
 
         // try {
-            $input = $request->except('_token');
+        $input = $request->except('_token');
 
-            $input['is_quotation'] = 0;
-            //status is send as quotation from Add sales screen.
-            if ($input['status'] == 'quotation') {
-                $input['status'] = 'draft';
-                $input['is_quotation'] = 1;
-                $input['sub_status'] = 'quotation';
-            } elseif ($input['status'] == 'proforma') {
-                $input['status'] = 'draft';
-                $input['sub_status'] = 'proforma';
+        $input['is_quotation'] = 0;
+        //status is send as quotation from Add sales screen.
+        if ($input['status'] == 'quotation') {
+            $input['status'] = 'draft';
+            $input['is_quotation'] = 1;
+            $input['sub_status'] = 'quotation';
+        } elseif ($input['status'] == 'proforma') {
+            $input['status'] = 'draft';
+            $input['sub_status'] = 'proforma';
+        }
+
+        //Add change return
+        $change_return = $this->dummyPaymentLine;
+        if (!empty($input['payment']['change_return'])) {
+            $change_return = $input['payment']['change_return'];
+            unset($input['payment']['change_return']);
+        }
+
+        //Check Customer credit limit
+        $is_credit_limit_exeeded = $this->transactionUtil->isCustomerCreditLimitExeeded($input);
+
+        if ($is_credit_limit_exeeded !== false) {
+            $credit_limit_amount = $this->transactionUtil->num_f($is_credit_limit_exeeded, true);
+            $output = [
+                'success' => 0,
+                'msg' => __('lang_v1.cutomer_credit_limit_exeeded', ['credit_limit' => $credit_limit_amount]),
+            ];
+            if (!$is_direct_sale) {
+                return $output;
+            } else {
+                return redirect()
+                    ->action([\App\Http\Controllers\SellController::class, 'index'])
+                    ->with('status', $output);
+            }
+        }
+
+        if (!empty($input['products'])) {
+            $business_id = $request->session()->get('user.business_id');
+
+            //Check if subscribed or not, then check for users quota
+            if (!$this->moduleUtil->isSubscribed($business_id)) {
+                return $this->moduleUtil->expiredResponse();
+            } elseif (!$this->moduleUtil->isQuotaAvailable('invoices', $business_id)) {
+                return $this->moduleUtil->quotaExpiredResponse('invoices', $business_id, action([\App\Http\Controllers\SellPosController::class, 'index']));
             }
 
-            //Add change return
-            $change_return = $this->dummyPaymentLine;
-            if (!empty($input['payment']['change_return'])) {
-                $change_return = $input['payment']['change_return'];
-                unset($input['payment']['change_return']);
+            $user_id = $request->session()->get('user.id');
+
+            $discount = [
+                'discount_type' => $input['discount_type'],
+                'discount_amount' => $input['discount_amount'],
+            ];
+            $invoice_total = $this->productUtil->calculateInvoiceTotal($input['products'], $input['tax_rate_id'], $discount);
+
+            DB::beginTransaction();
+
+            if (empty($request->input('transaction_date'))) {
+                $input['transaction_date'] = \Carbon::now();
+            } else {
+                $input['transaction_date'] = $this->productUtil->uf_date($request->input('transaction_date'), true);
+            }
+            if ($is_direct_sale) {
+                $input['is_direct_sale'] = 1;
             }
 
-            //Check Customer credit limit
-            $is_credit_limit_exeeded = $this->transactionUtil->isCustomerCreditLimitExeeded($input);
+            //Set commission agent
+            $input['commission_agent'] = !empty($request->input('commission_agent')) ? $request->input('commission_agent') : null;
+            $commsn_agnt_setting = $request->session()->get('business.sales_cmsn_agnt');
+            if ($commsn_agnt_setting == 'logged_in_user') {
+                $input['commission_agent'] = $user_id;
+            }
 
-            if ($is_credit_limit_exeeded !== false) {
-                $credit_limit_amount = $this->transactionUtil->num_f($is_credit_limit_exeeded, true);
-                $output = [
-                    'success' => 0,
-                    'msg' => __('lang_v1.cutomer_credit_limit_exeeded', ['credit_limit' => $credit_limit_amount]),
-                ];
+            if (isset($input['exchange_rate']) && $this->transactionUtil->num_uf($input['exchange_rate']) == 0) {
+                $input['exchange_rate'] = 1;
+            }
+
+            //Customer group details
+            $contact_id = $request->get('contact_id', null);
+            $cg = $this->contactUtil->getCustomerGroup($business_id, $contact_id);
+            $input['customer_group_id'] = (empty($cg) || empty($cg->id)) ? null : $cg->id;
+
+            //set selling price group id
+            $price_group_id = $request->has('price_group') ? $request->input('price_group') : null;
+
+            //If default price group for the location exists
+            $price_group_id = $price_group_id == 0 && $request->has('default_price_group') ? $request->input('default_price_group') : $price_group_id;
+
+            $input['is_suspend'] = isset($input['is_suspend']) && 1 == $input['is_suspend'] ? 1 : 0;
+            if ($input['is_suspend']) {
+                $input['sale_note'] = !empty($input['additional_notes']) ? $input['additional_notes'] : null;
+            }
+
+            //Generate reference number
+            if (!empty($input['is_recurring'])) {
+                //Update reference count
+                $ref_count = $this->transactionUtil->setAndGetReferenceCount('subscription');
+                $input['subscription_no'] = $this->transactionUtil->generateReferenceNumber('subscription', $ref_count);
+            }
+
+            if (!empty($request->input('invoice_scheme_id'))) {
+                $input['invoice_scheme_id'] = $request->input('invoice_scheme_id');
+            }
+
+            //Types of service
+            if ($this->moduleUtil->isModuleEnabled('types_of_service')) {
+                $input['types_of_service_id'] = $request->input('types_of_service_id');
+                $price_group_id = !empty($request->input('types_of_service_price_group')) ? $request->input('types_of_service_price_group') : $price_group_id;
+                $input['packing_charge'] = !empty($request->input('packing_charge')) ?
+                    $this->transactionUtil->num_uf($request->input('packing_charge')) : 0;
+                $input['packing_charge_type'] = $request->input('packing_charge_type');
+                $input['service_custom_field_1'] = !empty($request->input('service_custom_field_1')) ?
+                    $request->input('service_custom_field_1') : null;
+                $input['service_custom_field_2'] = !empty($request->input('service_custom_field_2')) ?
+                    $request->input('service_custom_field_2') : null;
+                $input['service_custom_field_3'] = !empty($request->input('service_custom_field_3')) ?
+                    $request->input('service_custom_field_3') : null;
+                $input['service_custom_field_4'] = !empty($request->input('service_custom_field_4')) ?
+                    $request->input('service_custom_field_4') : null;
+                $input['service_custom_field_5'] = !empty($request->input('service_custom_field_5')) ?
+                    $request->input('service_custom_field_5') : null;
+                $input['service_custom_field_6'] = !empty($request->input('service_custom_field_6')) ?
+                    $request->input('service_custom_field_6') : null;
+            }
+
+            if ($request->input('additional_expense_value_1') != '') {
+                $input['additional_expense_key_1'] = $request->input('additional_expense_key_1');
+                $input['additional_expense_value_1'] = $request->input('additional_expense_value_1');
+            }
+
+            if ($request->input('additional_expense_value_2') != '') {
+                $input['additional_expense_key_2'] = $request->input('additional_expense_key_2');
+                $input['additional_expense_value_2'] = $request->input('additional_expense_value_2');
+            }
+
+            if ($request->input('additional_expense_value_3') != '') {
+                $input['additional_expense_key_3'] = $request->input('additional_expense_key_3');
+                $input['additional_expense_value_3'] = $request->input('additional_expense_value_3');
+            }
+
+            if ($request->input('additional_expense_value_4') != '') {
+                $input['additional_expense_key_4'] = $request->input('additional_expense_key_4');
+                $input['additional_expense_value_4'] = $request->input('additional_expense_value_4');
+            }
+
+            $input['selling_price_group_id'] = $price_group_id;
+
+            if ($this->transactionUtil->isModuleEnabled('tables')) {
+                $input['res_table_id'] = request()->get('res_table_id');
+            }
+            if ($this->transactionUtil->isModuleEnabled('service_staff')) {
+                $input['res_waiter_id'] = request()->get('res_waiter_id');
+            }
+
+            if ($this->transactionUtil->isModuleEnabled('kitchen')) {
+                $input['is_kitchen_order'] = request()->get('is_kitchen_order');
+            }
+
+            //upload document
+            $input['document'] = $this->transactionUtil->uploadFile($request, 'sell_document', 'documents');
+
+            $transaction = $this->transactionUtil->createSellTransaction($business_id, $input, $invoice_total, $user_id);
+
+            //Upload Shipping documents
+            Media::uploadMedia($business_id, $transaction, $request, 'shipping_documents', false, 'shipping_document');
+
+            $this->transactionUtil->createOrUpdateSellLines($transaction, $input['products'], $input['location_id']);
+
+            $change_return['amount'] = $input['change_return'] ?? 0;
+            $change_return['is_return'] = 1;
+
+            $input['payment'][] = $change_return;
+
+            $is_credit_sale = isset($input['is_credit_sale']) && $input['is_credit_sale'] == 1 ? true : false;
+
+            if (!$transaction->is_suspend && !empty($input['payment']) && !$is_credit_sale) {
+                $this->transactionUtil->createOrUpdatePaymentLines($transaction, $input['payment']);
+            }
+
+            //Check for final and do some processing.
+            if ($input['status'] == 'final') {
                 if (!$is_direct_sale) {
-                    return $output;
-                } else {
-                    return redirect()
-                        ->action([\App\Http\Controllers\SellController::class, 'index'])
-                        ->with('status', $output);
-                }
-            }
+                    //set service staff timer
+                    foreach ($input['products'] as $product_line) {
+                        if (!empty($product_line['res_service_staff_id'])) {
+                            $product = Product::find($product_line['product_id']);
 
-            if (!empty($input['products'])) {
-                $business_id = $request->session()->get('user.business_id');
+                            if (!empty($product->preparation_time_in_minutes)) {
+                                $service_staff = User::find($product_line['res_service_staff_id']);
 
-                //Check if subscribed or not, then check for users quota
-                if (!$this->moduleUtil->isSubscribed($business_id)) {
-                    return $this->moduleUtil->expiredResponse();
-                } elseif (!$this->moduleUtil->isQuotaAvailable('invoices', $business_id)) {
-                    return $this->moduleUtil->quotaExpiredResponse('invoices', $business_id, action([\App\Http\Controllers\SellPosController::class, 'index']));
-                }
+                                $base_time = \Carbon::parse($transaction->transaction_date);
 
-                $user_id = $request->session()->get('user.id');
-
-                $discount = [
-                    'discount_type' => $input['discount_type'],
-                    'discount_amount' => $input['discount_amount'],
-                ];
-                $invoice_total = $this->productUtil->calculateInvoiceTotal($input['products'], $input['tax_rate_id'], $discount);
-
-                DB::beginTransaction();
-
-                if (empty($request->input('transaction_date'))) {
-                    $input['transaction_date'] = \Carbon::now();
-                } else {
-                    $input['transaction_date'] = $this->productUtil->uf_date($request->input('transaction_date'), true);
-                }
-                if ($is_direct_sale) {
-                    $input['is_direct_sale'] = 1;
-                }
-
-                //Set commission agent
-                $input['commission_agent'] = !empty($request->input('commission_agent')) ? $request->input('commission_agent') : null;
-                $commsn_agnt_setting = $request->session()->get('business.sales_cmsn_agnt');
-                if ($commsn_agnt_setting == 'logged_in_user') {
-                    $input['commission_agent'] = $user_id;
-                }
-
-                if (isset($input['exchange_rate']) && $this->transactionUtil->num_uf($input['exchange_rate']) == 0) {
-                    $input['exchange_rate'] = 1;
-                }
-
-                //Customer group details
-                $contact_id = $request->get('contact_id', null);
-                $cg = $this->contactUtil->getCustomerGroup($business_id, $contact_id);
-                $input['customer_group_id'] = (empty($cg) || empty($cg->id)) ? null : $cg->id;
-
-                //set selling price group id
-                $price_group_id = $request->has('price_group') ? $request->input('price_group') : null;
-
-                //If default price group for the location exists
-                $price_group_id = $price_group_id == 0 && $request->has('default_price_group') ? $request->input('default_price_group') : $price_group_id;
-
-                $input['is_suspend'] = isset($input['is_suspend']) && 1 == $input['is_suspend'] ? 1 : 0;
-                if ($input['is_suspend']) {
-                    $input['sale_note'] = !empty($input['additional_notes']) ? $input['additional_notes'] : null;
-                }
-
-                //Generate reference number
-                if (!empty($input['is_recurring'])) {
-                    //Update reference count
-                    $ref_count = $this->transactionUtil->setAndGetReferenceCount('subscription');
-                    $input['subscription_no'] = $this->transactionUtil->generateReferenceNumber('subscription', $ref_count);
-                }
-
-                if (!empty($request->input('invoice_scheme_id'))) {
-                    $input['invoice_scheme_id'] = $request->input('invoice_scheme_id');
-                }
-
-                //Types of service
-                if ($this->moduleUtil->isModuleEnabled('types_of_service')) {
-                    $input['types_of_service_id'] = $request->input('types_of_service_id');
-                    $price_group_id = !empty($request->input('types_of_service_price_group')) ? $request->input('types_of_service_price_group') : $price_group_id;
-                    $input['packing_charge'] = !empty($request->input('packing_charge')) ?
-                        $this->transactionUtil->num_uf($request->input('packing_charge')) : 0;
-                    $input['packing_charge_type'] = $request->input('packing_charge_type');
-                    $input['service_custom_field_1'] = !empty($request->input('service_custom_field_1')) ?
-                        $request->input('service_custom_field_1') : null;
-                    $input['service_custom_field_2'] = !empty($request->input('service_custom_field_2')) ?
-                        $request->input('service_custom_field_2') : null;
-                    $input['service_custom_field_3'] = !empty($request->input('service_custom_field_3')) ?
-                        $request->input('service_custom_field_3') : null;
-                    $input['service_custom_field_4'] = !empty($request->input('service_custom_field_4')) ?
-                        $request->input('service_custom_field_4') : null;
-                    $input['service_custom_field_5'] = !empty($request->input('service_custom_field_5')) ?
-                        $request->input('service_custom_field_5') : null;
-                    $input['service_custom_field_6'] = !empty($request->input('service_custom_field_6')) ?
-                        $request->input('service_custom_field_6') : null;
-                }
-
-                if ($request->input('additional_expense_value_1') != '') {
-                    $input['additional_expense_key_1'] = $request->input('additional_expense_key_1');
-                    $input['additional_expense_value_1'] = $request->input('additional_expense_value_1');
-                }
-
-                if ($request->input('additional_expense_value_2') != '') {
-                    $input['additional_expense_key_2'] = $request->input('additional_expense_key_2');
-                    $input['additional_expense_value_2'] = $request->input('additional_expense_value_2');
-                }
-
-                if ($request->input('additional_expense_value_3') != '') {
-                    $input['additional_expense_key_3'] = $request->input('additional_expense_key_3');
-                    $input['additional_expense_value_3'] = $request->input('additional_expense_value_3');
-                }
-
-                if ($request->input('additional_expense_value_4') != '') {
-                    $input['additional_expense_key_4'] = $request->input('additional_expense_key_4');
-                    $input['additional_expense_value_4'] = $request->input('additional_expense_value_4');
-                }
-
-                $input['selling_price_group_id'] = $price_group_id;
-
-                if ($this->transactionUtil->isModuleEnabled('tables')) {
-                    $input['res_table_id'] = request()->get('res_table_id');
-                }
-                if ($this->transactionUtil->isModuleEnabled('service_staff')) {
-                    $input['res_waiter_id'] = request()->get('res_waiter_id');
-                }
-
-                if ($this->transactionUtil->isModuleEnabled('kitchen')) {
-                    $input['is_kitchen_order'] = request()->get('is_kitchen_order');
-                }
-
-                //upload document
-                $input['document'] = $this->transactionUtil->uploadFile($request, 'sell_document', 'documents');
-
-                $transaction = $this->transactionUtil->createSellTransaction($business_id, $input, $invoice_total, $user_id);
-
-                //Upload Shipping documents
-                Media::uploadMedia($business_id, $transaction, $request, 'shipping_documents', false, 'shipping_document');
-
-                $this->transactionUtil->createOrUpdateSellLines($transaction, $input['products'], $input['location_id']);
-
-                $change_return['amount'] = $input['change_return'] ?? 0;
-                $change_return['is_return'] = 1;
-
-                $input['payment'][] = $change_return;
-
-                $is_credit_sale = isset($input['is_credit_sale']) && $input['is_credit_sale'] == 1 ? true : false;
-
-                if (!$transaction->is_suspend && !empty($input['payment']) && !$is_credit_sale) {
-                    $this->transactionUtil->createOrUpdatePaymentLines($transaction, $input['payment']);
-                }
-
-                //Check for final and do some processing.
-                if ($input['status'] == 'final') {
-                    if (!$is_direct_sale) {
-                        //set service staff timer
-                        foreach ($input['products'] as $product_line) {
-                            if (!empty($product_line['res_service_staff_id'])) {
-                                $product = Product::find($product_line['product_id']);
-
-                                if (!empty($product->preparation_time_in_minutes)) {
-                                    $service_staff = User::find($product_line['res_service_staff_id']);
-
-                                    $base_time = \Carbon::parse($transaction->transaction_date);
-
-                                    //if already assigned set base time as available_at
-                                    if (!empty($service_staff->available_at) && \Carbon::parse($service_staff->available_at)->gt(\Carbon::now())) {
-                                        $base_time = \Carbon::parse($service_staff->available_at);
-                                    }
-
-                                    $total_minutes = $product->preparation_time_in_minutes * $this->transactionUtil->num_uf($product_line['quantity']);
-
-                                    $service_staff->available_at = $base_time->addMinutes($total_minutes);
-                                    $service_staff->save();
+                                //if already assigned set base time as available_at
+                                if (!empty($service_staff->available_at) && \Carbon::parse($service_staff->available_at)->gt(\Carbon::now())) {
+                                    $base_time = \Carbon::parse($service_staff->available_at);
                                 }
+
+                                $total_minutes = $product->preparation_time_in_minutes * $this->transactionUtil->num_uf($product_line['quantity']);
+
+                                $service_staff->available_at = $base_time->addMinutes($total_minutes);
+                                $service_staff->save();
                             }
                         }
                     }
-                    //update product stock
-                    foreach ($input['products'] as $product) {
-                        $decrease_qty = $this->productUtil
-                            ->num_uf($product['quantity']);
-                        if (!empty($product['base_unit_multiplier'])) {
-                            $decrease_qty = $decrease_qty * $product['base_unit_multiplier'];
-                        }
+                }
+                //update product stock
+                foreach ($input['products'] as $product) {
+                    $decrease_qty = $this->productUtil
+                        ->num_uf($product['quantity']);
+                    if (!empty($product['base_unit_multiplier'])) {
+                        $decrease_qty = $decrease_qty * $product['base_unit_multiplier'];
+                    }
 
-                        if ($product['enable_stock']) {
-                            $this->productUtil->decreaseProductQuantity(
-                                $product['product_id'],
-                                $product['variation_id'],
-                                $input['location_id'],
-                                $decrease_qty
+                    if ($product['enable_stock']) {
+                        $this->productUtil->decreaseProductQuantity(
+                            $product['product_id'],
+                            $product['variation_id'],
+                            $input['location_id'],
+                            $decrease_qty
+                        );
+                    }
+
+                    if ($product['product_type'] == 'combo') {
+                        //Decrease quantity of combo as well.
+                        $this->productUtil
+                            ->decreaseProductQuantityCombo(
+                                $product['combo'],
+                                $input['location_id']
                             );
-                        }
-
-                        if ($product['product_type'] == 'combo') {
-                            //Decrease quantity of combo as well.
-                            $this->productUtil
-                                ->decreaseProductQuantityCombo(
-                                    $product['combo'],
-                                    $input['location_id']
-                                );
-                        }
                     }
-
-                    //Add payments to Cash Register
-                    if (!$is_direct_sale && !$transaction->is_suspend && !empty($input['payment']) && !$is_credit_sale) {
-                        $this->cashRegisterUtil->addSellPayments($transaction, $input['payment']);
-                    }
-
-                    //Update payment status
-                    $payment_status = $this->transactionUtil->updatePaymentStatus($transaction->id, $transaction->final_total);
-
-                    $transaction->payment_status = $payment_status;
-
-                    if ($request->session()->get('business.enable_rp') == 1) {
-                        $redeemed = !empty($input['rp_redeemed']) ? $input['rp_redeemed'] : 0;
-                        $this->transactionUtil->updateCustomerRewardPoints($contact_id, $transaction->rp_earned, 0, $redeemed);
-                    }
-
-                    //Allocate the quantity from purchase and add mapping of
-                    //purchase & sell lines in
-                    //transaction_sell_lines_purchase_lines table
-                    $business_details = $this->businessUtil->getDetails($business_id);
-                    $pos_settings = empty($business_details->pos_settings) ? $this->businessUtil->defaultPosSettings() : json_decode($business_details->pos_settings, true);
-
-                    $business = [
-                        'id' => $business_id,
-                        'accounting_method' => $request->session()->get('business.accounting_method'),
-                        'location_id' => $input['location_id'],
-                        'pos_settings' => $pos_settings,
-                    ];
-                    $this->transactionUtil->mapPurchaseSell($business, $transaction->sell_lines, 'purchase');
-
-                    //Auto send notification
-                    $whatsapp_link = $this->notificationUtil->autoSendNotification($business_id, 'new_sale', $transaction, $transaction->contact);
                 }
 
-                if (!empty($transaction->sales_order_ids)) {
-                    $this->transactionUtil->updateSalesOrderStatus($transaction->sales_order_ids);
+                //Add payments to Cash Register
+                if (!$is_direct_sale && !$transaction->is_suspend && !empty($input['payment']) && !$is_credit_sale) {
+                    $this->cashRegisterUtil->addSellPayments($transaction, $input['payment']);
                 }
 
-                $this->moduleUtil->getModuleData('after_sale_saved', ['transaction' => $transaction, 'input' => $input]);
+                //Update payment status
+                $payment_status = $this->transactionUtil->updatePaymentStatus($transaction->id, $transaction->final_total);
 
-                Media::uploadMedia($business_id, $transaction, $request, 'documents');
+                $transaction->payment_status = $payment_status;
 
-                $this->transactionUtil->activityLog($transaction, 'added');
-
-                $auto_migration = $this->transactionUtil->saveAutoMigration($request, $transaction, $business_id, $user_id);
-
-                DB::commit();
-
-                // SellCreatedOrModified::dispatch($transaction);
-
-                if ($request->input('is_save_and_print') == 1) {
-                    $url = $this->transactionUtil->getInvoiceUrl($transaction->id, $business_id);
-
-                    return redirect()->to($url . '?print_on_load=true');
+                if ($request->session()->get('business.enable_rp') == 1) {
+                    $redeemed = !empty($input['rp_redeemed']) ? $input['rp_redeemed'] : 0;
+                    $this->transactionUtil->updateCustomerRewardPoints($contact_id, $transaction->rp_earned, 0, $redeemed);
                 }
 
-                $msg = trans('sale.pos_sale_added');
-                $receipt = '';
-                $invoice_layout_id = $request->input('invoice_layout_id');
-                $print_invoice = false;
-                if (!$is_direct_sale) {
-                    if ($input['status'] == 'draft') {
-                        $msg = trans('sale.draft_added');
+                //Allocate the quantity from purchase and add mapping of
+                //purchase & sell lines in
+                //transaction_sell_lines_purchase_lines table
+                $business_details = $this->businessUtil->getDetails($business_id);
+                $pos_settings = empty($business_details->pos_settings) ? $this->businessUtil->defaultPosSettings() : json_decode($business_details->pos_settings, true);
 
-                        if ($input['is_quotation'] == 1) {
-                            $msg = trans('lang_v1.quotation_added');
-                            $print_invoice = true;
-                        }
-                    } elseif ($input['status'] == 'final') {
+                $business = [
+                    'id' => $business_id,
+                    'accounting_method' => $request->session()->get('business.accounting_method'),
+                    'location_id' => $input['location_id'],
+                    'pos_settings' => $pos_settings,
+                ];
+                $this->transactionUtil->mapPurchaseSell($business, $transaction->sell_lines, 'purchase');
+
+                //Auto send notification
+                $whatsapp_link = $this->notificationUtil->autoSendNotification($business_id, 'new_sale', $transaction, $transaction->contact);
+            }
+
+            if (!empty($transaction->sales_order_ids)) {
+                $this->transactionUtil->updateSalesOrderStatus($transaction->sales_order_ids);
+            }
+
+            $this->moduleUtil->getModuleData('after_sale_saved', ['transaction' => $transaction, 'input' => $input]);
+
+            Media::uploadMedia($business_id, $transaction, $request, 'documents');
+
+            $this->transactionUtil->activityLog($transaction, 'added');
+
+            $auto_migration = $this->transactionUtil->saveAutoMigration($request, $transaction, $business_id, $user_id);
+
+            DB::commit();
+
+            // SellCreatedOrModified::dispatch($transaction);
+
+            if ($request->input('is_save_and_print') == 1) {
+                $url = $this->transactionUtil->getInvoiceUrl($transaction->id, $business_id);
+
+                return redirect()->to($url . '?print_on_load=true');
+            }
+
+            $msg = trans('sale.pos_sale_added');
+            $receipt = '';
+            $invoice_layout_id = $request->input('invoice_layout_id');
+            $print_invoice = false;
+            if (!$is_direct_sale) {
+                if ($input['status'] == 'draft') {
+                    $msg = trans('sale.draft_added');
+
+                    if ($input['is_quotation'] == 1) {
+                        $msg = trans('lang_v1.quotation_added');
                         $print_invoice = true;
                     }
+                } elseif ($input['status'] == 'final') {
+                    $print_invoice = true;
                 }
-
-                if ($transaction->is_suspend == 1 && empty($pos_settings['print_on_suspend'])) {
-                    $print_invoice = false;
-                }
-
-                if (!auth()->user()->can('print_invoice')) {
-                    $print_invoice = false;
-                }
-
-                if ($print_invoice) {
-                    $receipt = $this->receiptContent($business_id, $input['location_id'], $transaction->id, null, false, true, $invoice_layout_id);
-                }
-
-                $output = ['success' => 1, 'msg' => $msg, 'receipt' => $receipt];
- 
-                if (!empty($whatsapp_link)) {
-                    $output['whatsapp_link'] = $whatsapp_link;
-                }
-            } else {
-                $output = [
-                    'success' => 0,
-                    'msg' => trans('messages.something_went_wrong'),
-                ];
             }
+
+            if ($transaction->is_suspend == 1 && empty($pos_settings['print_on_suspend'])) {
+                $print_invoice = false;
+            }
+
+            if (!auth()->user()->can('print_invoice')) {
+                $print_invoice = false;
+            }
+
+            if ($print_invoice) {
+                $receipt = $this->receiptContent($business_id, $input['location_id'], $transaction->id, null, false, true, $invoice_layout_id);
+            }
+
+            $output = ['success' => 1, 'msg' => $msg, 'receipt' => $receipt];
+
+            if (!empty($whatsapp_link)) {
+                $output['whatsapp_link'] = $whatsapp_link;
+            }
+        } else {
+            $output = [
+                'success' => 0,
+                'msg' => trans('messages.something_went_wrong'),
+            ];
+        }
         // } catch (\Exception $e) {
         //     DB::rollBack();
         //     \Log::emergency('File:' . $e->getFile() . 'Line:' . $e->getLine() . 'Message:' . $e->getMessage());
@@ -703,6 +705,891 @@ class SellPosController extends Controller
             }
         }
     }
+    // public function generateXmlInvoice()
+    // {
+    //     $xmlContent = $this->generateZATCAInvoiceXML();
+    //     return response($xmlContent)->header('Content-Type', 'text/xml');
+    // }
+    public function generateXmlInvoice()
+    {
+        // Generate the XML content using the previously defined function
+        $xmlContent = $this->generateZATCAInvoiceXML();
+
+        // Define the file path and name in the public directory
+        $filePath = public_path('invoices/invoice_' . date('YmdHis') . '.xml');
+
+        // Check if the 'invoices' directory exists in the public directory; create if not
+        $dirPath = public_path('invoices');
+        if (!file_exists($dirPath)) {
+            mkdir($dirPath, 0777, true);
+        }
+
+        // Save the XML content to a file in the public directory
+        file_put_contents($filePath, $xmlContent);
+
+        // Optionally, return a download response or a message that the file has been saved
+        return response()->json([
+            'message' => 'Invoice XML generated and saved successfully.',
+            'file_path' => $filePath
+        ]);
+    }
+    /*
+    public function generateInvoiceXML()
+    {
+        $xml = $this->createRootElement();
+        $this->addUBLExtensions($xml);
+        $this->addInvoiceDetails($xml);
+        $this->addAdditionalDocumentReferences($xml);
+        $this->addSignature($xml);
+        $this->addAccountingSupplierParty($xml);
+        $this->addAccountingCustomerParty($xml);
+        $this->addDelivery($xml);
+        $this->addPaymentMeans($xml);
+        $this->addAllowanceCharge($xml);
+        $this->addTaxTotal($xml);
+        $this->addLegalMonetaryTotal($xml);
+        $this->addInvoiceLine($xml);
+
+        $filePath = public_path('invoices/invoice.xml');
+        $xmlContent = $xml->asXML();
+
+        if (!file_exists(public_path('invoices'))) {
+            mkdir(public_path('invoices'), 0777, true);
+        }
+
+        file_put_contents($filePath, $xmlContent);
+
+        return response()->download($filePath);
+    }
+    private function createRootElement()
+    {
+        return new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2" xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2" xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2" xmlns:ext="urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2"></Invoice>');
+    }
+    private function addUBLExtensions($xml)
+    {
+        $extUBLExtensions = $xml->addChild('ext:UBLExtensions', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2');
+        $extUBLExtension = $extUBLExtensions->addChild('ext:UBLExtension', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2');
+        $extExtensionContent = $extUBLExtension->addChild('ext:ExtensionContent', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2');
+
+        $sigUBLDocumentSignatures = $extExtensionContent->addChild('sig:UBLDocumentSignatures', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonSignatureComponents-2');
+        $sacSignatureInformation = $sigUBLDocumentSignatures->addChild('sac:SignatureInformation', '', 'urn:oasis:names:specification:ubl:schema:xsd:SignatureAggregateComponents-2');
+        $sacSignatureInformation->addChild('cbc:ID', 'urn:oasis:names:specification:ubl:signature:1', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $sacSignatureInformation->addChild('sbc:ReferencedSignatureID', 'urn:oasis:names:specification:ubl:signature:Invoice', 'urn:oasis:names:specification:ubl:schema:xsd:SignatureBasicComponents-2');
+
+        $dsSignature = $sacSignatureInformation->addChild('ds:Signature', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsSignature->addAttribute('Id', 'signature');
+
+        $dsSignedInfo = $dsSignature->addChild('ds:SignedInfo', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsSignedInfo->addChild('ds:CanonicalizationMethod', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2006/12/xml-c14n11');
+        $dsSignedInfo->addChild('ds:SignatureMethod', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256');
+
+        $dsReference1 = $dsSignedInfo->addChild('ds:Reference', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsReference1->addAttribute('Id', 'invoiceSignedData');
+        $dsReference1->addAttribute('URI', '');
+
+        $dsTransforms1 = $dsReference1->addChild('ds:Transforms', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsTransform1 = $dsTransforms1->addChild('ds:Transform', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsTransform1->addAttribute('Algorithm', 'http://www.w3.org/TR/1999/REC-xpath-19991116');
+        $dsTransform1->addChild('ds:XPath', 'not(//ancestor-or-self::ext:UBLExtensions)', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsTransform2 = $dsTransforms1->addChild('ds:Transform', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsTransform2->addAttribute('Algorithm', 'http://www.w3.org/TR/1999/REC-xpath-19991116');
+        $dsTransform2->addChild('ds:XPath', 'not(//ancestor-or-self::cac:Signature)', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsTransform3 = $dsTransforms1->addChild('ds:Transform', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsTransform3->addAttribute('Algorithm', 'http://www.w3.org/TR/1999/REC-xpath-19991116');
+        $dsTransform3->addChild('ds:XPath', 'not(//ancestor-or-self::cac:AdditionalDocumentReference[cbc:ID=\'QR\'])', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsTransforms1->addChild('ds:Transform', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2006/12/xml-c14n11');
+
+        $dsReference1->addChild('ds:DigestMethod', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2001/04/xmlenc#sha256');
+        $dsReference1->addChild('ds:DigestValue', 'f+0WCqnPkInI+eL9G3LAry12fTPf+toC9UX07F4fI+s=', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsReference2 = $dsSignedInfo->addChild('ds:Reference', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsReference2->addAttribute('Type', 'http://www.w3.org/2000/09/xmldsig#SignatureProperties');
+        $dsReference2->addAttribute('URI', '#xadesSignedProperties');
+
+        $dsReference2->addChild('ds:DigestMethod', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2001/04/xmlenc#sha256');
+        $dsReference2->addChild('ds:DigestValue', 'ODQwNTg1NTBhMjMzM2YxY2ZkZjVkYzdlNTZiZjY0ODJjMjNkYWI4MTUzNjdmNDVjMjAwZTBjODc2YTNhMWQ1Ng==', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsSignature->addChild('ds:SignatureValue', 'MEUCIBxyR8rc4K8728wdSF4XSDqPs+rIL+3TFh9m+aNxQPtSAiEA6cHapItvp13yMSu66NbOg2CpomHwUSnYJ9h6uGQ65aY=', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsKeyInfo = $dsSignature->addChild('ds:KeyInfo', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsX509Data = $dsKeyInfo->addChild('ds:X509Data', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsX509Data->addChild('ds:X509Certificate', 'MIID3jCCA4SgAwIBAgITEQAAOAPF90Ajs/xcXwABAAA4AzAKBggqhkjOPQQDAjBiMRUwEwYKCZImiZPyLGQBGRYFbG9jYWwxEzARBgoJkiaJk/IsZAEZFgNnb3YxFzAVBgoJkiaJk/IsZAEZFgdleHRnYXp0MRswGQYDVQQDExJQUlpFSU5WT0lDRVNDQTQtQ0EwHhcNMjQwMTExMDkxOTMwWhcNMjkwMTA5MDkxOTMwWjB1MQswCQYDVQQGEwJTQTEmMCQGA1UEChMdTWF4aW11bSBTcGVlZCBUZWNoIFN1cHBseSBMVEQxFjAUBgNVBAsTDVJpeWFkaCBCcmFuY2gxJjAkBgNVBAMTHVRTVC04ODY0MzExNDUtMzk5OTk5OTk5OTAwMDAzMFYwEAYHKoZIzj0CAQYFK4EEAAoDQgAEoWCKa0Sa9FIErTOv0uAkC1VIKXxU9nPpx2vlf4yhMejy8c02XJblDq7tPydo8mq0ahOMmNo8gwni7Xt1KT9UeKOCAgcwggIDMIGtBgNVHREEgaUwgaKkgZ8wgZwxOzA5BgNVBAQMMjEtVFNUfDItVFNUfDMtZWQyMmYxZDgtZTZhMi0xMTE4LTliNTgtZDlhOGYxMWU0NDVmMR8wHQYKCZImiZPyLGQBAQwPMzk5OTk5OTk5OTAwMDAzMQ0wCwYDVQQMDAQxMTAwMREwDwYDVQQaDAhSUlJEMjkyOTEaMBgGA1UEDwwRU3VwcGx5IGFjdGl2aXRpZXMwHQYDVR0OBBYEFEX+YvmmtnYoDf9BGbKo7ocTKYK1MB8GA1UdIwQYMBaAFJvKqqLtmqwskIFzVvpP2PxT+9NnMHsGCCsGAQUFBwEBBG8wbTBrBggrBgEFBQcwAoZfaHR0cDovL2FpYTQuemF0Y2EuZ292LnNhL0NlcnRFbnJvbGwvUFJaRUludm9pY2VTQ0E0LmV4dGdhenQuZ292LmxvY2FsX1BSWkVJTlZPSUNFU0NBNC1DQSgxKS5jcnQwDgYDVR0PAQH/BAQDAgeAMDwGCSsGAQQBgjcVBwQvMC0GJSsGAQQBgjcVCIGGqB2E0PsShu2dJIfO+xnTwFVmh/qlZYXZhD4CAWQCARIwHQYDVR0lBBYwFAYIKwYBBQUHAwMGCCsGAQUFBwMCMCcGCSsGAQQBgjcVCgQaMBgwCgYIKwYBBQUHAwMwCgYIKwYBBQUHAwIwCgYIKoZIzj0EAwIDSAAwRQIhALE/ichmnWXCUKUbca3yci8oqwaLvFdHVjQrveI9uqAbAiA9hC4M8jgMBADPSzmd2uiPJA6gKR3LE03U75eqbC/rXA==', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsObject = $dsSignature->addChild('ds:Object', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $xadesQualifyingProperties = $dsObject->addChild('xades:QualifyingProperties', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesQualifyingProperties->addAttribute('Target', 'signature');
+
+        $xadesSignedProperties = $xadesQualifyingProperties->addChild('xades:SignedProperties', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesSignedProperties->addAttribute('Id', 'xadesSignedProperties');
+
+        $xadesSignedSignatureProperties = $xadesSignedProperties->addChild('xades:SignedSignatureProperties', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesSignedSignatureProperties->addChild('xades:SigningTime', '2024-01-14T10:21:40', 'http://uri.etsi.org/01903/v1.3.2#');
+
+        $xadesSigningCertificate = $xadesSignedSignatureProperties->addChild('xades:SigningCertificate', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesCert = $xadesSigningCertificate->addChild('xades:Cert', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesCertDigest = $xadesCert->addChild('xades:CertDigest', '', 'http://uri.etsi.org/01903/v1.3.2#');
+
+        $xadesCertDigest->addChild('ds:DigestMethod', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2001/04/xmlenc#sha256');
+        $xadesCertDigest->addChild('ds:DigestValue', 'ZDMwMmI0MTE1NzVjOTU2NTk4YzVlODhhYmI0ODU2NDUyNTU2YTVhYjhhMDFmN2FjYjk1YTA2OWQ0NjY2MjQ4NQ==', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $xadesIssuerSerial = $xadesCert->addChild('xades:IssuerSerial', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesIssuerSerial->addChild('ds:X509IssuerName', 'CN=PRZEINVOICESCA4-CA, DC=extgazt, DC=gov, DC=local', 'http://www.w3.org/2000/09/xmldsig#');
+        $xadesIssuerSerial->addChild('ds:X509SerialNumber', '379112742831380471835263969587287663520528387', 'http://www.w3.org/2000/09/xmldsig#');
+    }
+
+    private function addInvoiceDetails($xml)
+    {
+        $xml->addChild('cbc:ProfileID', 'reporting:1.0', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:ID', 'SME00023', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:UUID', '8d487816-70b8-4ade-a618-9d620b73814a', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:IssueDate', '2022-09-07', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:IssueTime', '12:21:28', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:InvoiceTypeCode', '388', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('name', '0100000');
+        $xml->addChild('cbc:DocumentCurrencyCode', 'SAR', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:TaxCurrencyCode', 'SAR', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+    private function addAdditionalDocumentReferences($xml)
+    {
+        $additionalDocumentReference1 = $xml->addChild('cac:AdditionalDocumentReference', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $additionalDocumentReference1->addChild('cbc:ID', 'ICV', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $additionalDocumentReference1->addChild('cbc:UUID', '23', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $additionalDocumentReference2 = $xml->addChild('cac:AdditionalDocumentReference', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $additionalDocumentReference2->addChild('cbc:ID', 'PIH', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacAttachment2 = $additionalDocumentReference2->addChild('cac:Attachment', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacAttachment2->addChild('cbc:EmbeddedDocumentBinaryObject', 'NWZlY2ViNjZmZmM4NmYzOGQ5NTI3ODZjNmQ2OTZjNzljMmRiYzIzOWRkNGU5MWI0NjcyOWQ3M2EyN2ZiNTdlOQ==', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('mimeCode', 'text/plain');
+
+        $additionalDocumentReference3 = $xml->addChild('cac:AdditionalDocumentReference', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $additionalDocumentReference3->addChild('cbc:ID', 'QR', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacAttachment3 = $additionalDocumentReference3->addChild('cac:Attachment', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacAttachment3->addChild('cbc:EmbeddedDocumentBinaryObject', 'AW/YtNix2YPYqSDYqtmI2LHZitivINin2YTYqtmD2YbZiNmE2YjYrNmK2Kcg2KjYo9mC2LXZiSDYs9ix2LnYqSDYp9mE2YXYrdiv2YjYr9ipIHwgTWF4aW11bSBTcGVlZCBUZWNoIFN1cHBseSBMVEQCDzM5OTk5OTk5OTkwMDAwMwMTMjAyMi0wOS0wN1QxMjoyMToyOAQENC42MAUDMC42BixmKzBXQ3FuUGtJbkkrZUw5RzNMQXJ5MTJmVFBmK3RvQzlVWDA3RjRmSStzPQdgTUVVQ0lCeHlSOHJjNEs4NzI4d2RTRjRYU0RxUHMrcklMKzNURmg5bSthTnhRUHRTQWlFQTZjSGFwSXR2cDEzeU1TdTY2TmJPZzJDcG9tSHdVU25ZSjloNnVHUTY1YVk9CFgwVjAQBgcqhkjOPQIBBgUrgQQACgNCAAShYIprRJr0UgStM6/S4CQLVUgpfFT2c+nHa+V/jKEx6PLxzTZcluUOru0/J2jyarRqE4yY2jyDCeLte3UpP1R4', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('mimeCode', 'text/plain');
+    }
+    private function addSignature($xml)
+    {
+        $cacSignature = $xml->addChild('cac:Signature', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacSignature->addChild('cbc:ID', 'urn:oasis:names:specification:ubl:signature:Invoice', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacSignature->addChild('cbc:SignatureMethod', 'urn:oasis:names:specification:ubl:dsig:enveloped:xades', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+
+    private function addAccountingSupplierParty($xml)
+    {
+        $cacAccountingSupplierParty = $xml->addChild('cac:AccountingSupplierParty', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPartySupplier = $cacAccountingSupplierParty->addChild('cac:Party', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPartySupplier->addChild('cac:PartyIdentification', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2')->addChild('cbc:ID', '1010010000', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('schemeID', 'CRN');
+
+        $cacPostalAddressSupplier = $cacPartySupplier->addChild('cac:PostalAddress', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPostalAddressSupplier->addChild('cbc:StreetName', 'الامير سلطان | Prince Sultan', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacPostalAddressSupplier->addChild('cbc:BuildingNumber', '2322', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacPostalAddressSupplier->addChild('cbc:CitySubdivisionName', 'المربع | Al-Murabba', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacPostalAddressSupplier->addChild('cbc:CityName', 'الرياض | Riyadh', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacPostalAddressSupplier->addChild('cbc:PostalZone', '23333', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacCountrySupplier = $cacPostalAddressSupplier->addChild('cac:Country', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacCountrySupplier->addChild('cbc:IdentificationCode', 'SA', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacPartyTaxSchemeSupplier = $cacPartySupplier->addChild('cac:PartyTaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPartyTaxSchemeSupplier->addChild('cbc:CompanyID', '399999999900003', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacTaxSchemeSupplier = $cacPartyTaxSchemeSupplier->addChild('cac:TaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacTaxSchemeSupplier->addChild('cbc:ID', 'VAT', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacPartyLegalEntitySupplier = $cacPartySupplier->addChild('cac:PartyLegalEntity', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPartyLegalEntitySupplier->addChild('cbc:RegistrationName', 'شركة توريد التكنولوجيا بأقصى سرعة المحدودة | Maximum Speed Tech Supply LTD', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+
+    private function addAccountingCustomerParty($xml)
+    {
+        $cacAccountingCustomerParty = $xml->addChild('cac:AccountingCustomerParty', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPartyCustomer = $cacAccountingCustomerParty->addChild('cac:Party', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+
+        $cacPostalAddressCustomer = $cacPartyCustomer->addChild('cac:PostalAddress', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPostalAddressCustomer->addChild('cbc:StreetName', 'صلاح الدين | Salah Al-Din', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacPostalAddressCustomer->addChild('cbc:BuildingNumber', '1111', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacPostalAddressCustomer->addChild('cbc:CitySubdivisionName', 'المروج | Al-Murooj', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacPostalAddressCustomer->addChild('cbc:CityName', 'الرياض | Riyadh', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacPostalAddressCustomer->addChild('cbc:PostalZone', '12222', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacCountryCustomer = $cacPostalAddressCustomer->addChild('cac:Country', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacCountryCustomer->addChild('cbc:IdentificationCode', 'SA', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacPartyTaxSchemeCustomer = $cacPartyCustomer->addChild('cac:PartyTaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPartyTaxSchemeCustomer->addChild('cbc:CompanyID', '399999999800003', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacTaxSchemeCustomer = $cacPartyTaxSchemeCustomer->addChild('cac:TaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacTaxSchemeCustomer->addChild('cbc:ID', 'VAT', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacPartyLegalEntityCustomer = $cacPartyCustomer->addChild('cac:PartyLegalEntity', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPartyLegalEntityCustomer->addChild('cbc:RegistrationName', 'شركة نماذج فاتورة المحدودة | Fatoora Samples LTD', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+    private function addDelivery($xml)
+    {
+        $cacDelivery = $xml->addChild('cac:Delivery', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacDelivery->addChild('cbc:ActualDeliveryDate', '2022-09-07', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+
+    private function addPaymentMeans($xml)
+    {
+        $cacPaymentMeans = $xml->addChild('cac:PaymentMeans', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPaymentMeans->addChild('cbc:PaymentMeansCode', '10', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+    private function addAllowanceCharge($xml)
+    {
+        $cacAllowanceCharge = $xml->addChild('cac:AllowanceCharge', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacAllowanceCharge->addChild('cbc:ChargeIndicator', 'false', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacAllowanceCharge->addChild('cbc:AllowanceChargeReason', 'discount', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacAllowanceCharge->addChild('cbc:Amount', '0.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $cacTaxCategory = $cacAllowanceCharge->addChild('cac:TaxCategory', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cbcID = $cacTaxCategory->addChild('cbc:ID', 'S', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cbcID->addAttribute('schemeID', 'UN/ECE 5305');
+        $cbcID->addAttribute('schemeAgencyID', '6');
+        $cacTaxCategory->addChild('cbc:Percent', '15', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacTaxScheme = $cacTaxCategory->addChild('cac:TaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cbcTaxSchemeID = $cacTaxScheme->addChild('cbc:ID', 'VAT', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cbcTaxSchemeID->addAttribute('schemeID', 'UN/ECE 5153');
+        $cbcTaxSchemeID->addAttribute('schemeAgencyID', '6');
+    }
+
+    private function addTaxTotal($xml)
+    {
+        $cacTaxTotal = $xml->addChild('cac:TaxTotal', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacTaxTotal->addChild('cbc:TaxAmount', '0.6', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $cacTaxSubtotal = $cacTaxTotal->addChild('cac:TaxSubtotal', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacTaxSubtotal->addChild('cbc:TaxableAmount', '4.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $cacTaxSubtotal->addChild('cbc:TaxAmount', '0.60', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $cacTaxCategory2 = $cacTaxSubtotal->addChild('cac:TaxCategory', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cbcID = $cacTaxCategory2->addChild('cbc:ID', 'S', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cbcID->addAttribute('schemeID', 'UN/ECE 5305');
+        $cbcID->addAttribute('schemeAgencyID', '6');
+        $cacTaxCategory2->addChild('cbc:Percent', '15.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacTaxScheme2 = $cacTaxCategory2->addChild('cac:TaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cbcTaxSchemeID = $cacTaxScheme2->addChild('cbc:ID', 'VAT', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cbcTaxSchemeID->addAttribute('schemeID', 'UN/ECE 5153');
+        $cbcTaxSchemeID->addAttribute('schemeAgencyID', '6');
+    }
+
+    private function addLegalMonetaryTotal($xml)
+    {
+        $cacLegalMonetaryTotal = $xml->addChild('cac:LegalMonetaryTotal', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacLegalMonetaryTotal->addChild('cbc:LineExtensionAmount', '4.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $cacLegalMonetaryTotal->addChild('cbc:TaxExclusiveAmount', '4.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $cacLegalMonetaryTotal->addChild('cbc:TaxInclusiveAmount', '4.60', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $cacLegalMonetaryTotal->addChild('cbc:AllowanceTotalAmount', '0.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $cacLegalMonetaryTotal->addChild('cbc:PrepaidAmount', '0.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $cacLegalMonetaryTotal->addChild('cbc:PayableAmount', '4.60', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+    }
+    private function addInvoiceLine($xml)
+    {
+        $cacInvoiceLine = $xml->addChild('cac:InvoiceLine', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacInvoiceLine->addChild('cbc:ID', '1', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacInvoiceLine->addChild('cbc:InvoicedQuantity', '2.000000', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('unitCode', 'PCE');
+        $cacInvoiceLine->addChild('cbc:LineExtensionAmount', '4.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $cacTaxTotalLine = $cacInvoiceLine->addChild('cac:TaxTotal', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacTaxTotalLine->addChild('cbc:TaxAmount', '0.60', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $cacTaxTotalLine->addChild('cbc:RoundingAmount', '4.60', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $cacItem = $cacInvoiceLine->addChild('cac:Item', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacItem->addChild('cbc:Name', 'قلم رصاص', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacClassifiedTaxCategory = $cacItem->addChild('cac:ClassifiedTaxCategory', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacClassifiedTaxCategory->addChild('cbc:ID', 'S', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacClassifiedTaxCategory->addChild('cbc:Percent', '15.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacTaxScheme3 = $cacClassifiedTaxCategory->addChild('cac:TaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacTaxScheme3->addChild('cbc:ID', 'VAT', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacPrice = $cacInvoiceLine->addChild('cac:Price', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPrice->addChild('cbc:PriceAmount', '2.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $cacAllowanceChargePrice = $cacPrice->addChild('cac:AllowanceCharge', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacAllowanceChargePrice->addChild('cbc:ChargeIndicator', 'true', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacAllowanceChargePrice->addChild('cbc:AllowanceChargeReason', 'discount', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacAllowanceChargePrice->addChild('cbc:Amount', '0.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+    }
+*/
+
+
+    /*
+    public function generateInvoiceXML()
+    {
+        $xml = $this->createRootElement();
+        $this->addUBLExtensions($xml);
+        $this->addInvoiceDetails($xml);
+        $this->addAdditionalDocumentReferences($xml);
+        $this->addSignature($xml);
+        $this->addAccountingSupplierParty($xml);
+        $this->addAccountingCustomerParty($xml);
+        $this->addDelivery($xml);
+        $this->addPaymentMeans($xml);
+        $this->addAllowanceCharge($xml);
+        $this->addTaxTotal($xml);
+        $this->addLegalMonetaryTotal($xml);
+        $this->addInvoiceLine($xml);
+
+        $filePath = public_path('invoices/invoice.xml');
+        $xmlContent = $xml->asXML();
+
+        if (!file_exists(public_path('invoices'))) {
+            mkdir(public_path('invoices'), 0777, true);
+        }
+
+        file_put_contents($filePath, $xmlContent);
+
+        return response()->download($filePath);
+    }
+
+    private function createRootElement()
+    {
+        $xmlString = '<?xml version="1.0" encoding="UTF-8"?><Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2" xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2" xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2" xmlns:ext="urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2"></Invoice>';
+        $xml = new SimpleXMLElement($xmlString, 0, false, 'cbc', true);
+        return $xml;
+    }
+
+    private function addUBLExtensions($xml)
+    {
+        $extUBLExtensions = $xml->addChild('ext:UBLExtensions', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2');
+        $extUBLExtension = $extUBLExtensions->addChild('ext:UBLExtension', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2');
+        $extExtensionContent = $extUBLExtension->addChild('ext:ExtensionContent', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2');
+
+        $sigUBLDocumentSignatures = $extExtensionContent->addChild('sig:UBLDocumentSignatures', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonSignatureComponents-2');
+        $sacSignatureInformation = $sigUBLDocumentSignatures->addChild('sac:SignatureInformation', '', 'urn:oasis:names:specification:ubl:schema:xsd:SignatureAggregateComponents-2');
+        $sacSignatureInformation->addChild('cbc:ID', 'urn:oasis:names:specification:ubl:signature:1', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $sacSignatureInformation->addChild('sbc:ReferencedSignatureID', 'urn:oasis:names:specification:ubl:signature:Invoice', 'urn:oasis:names:specification:ubl:schema:xsd:SignatureBasicComponents-2');
+
+        $dsSignature = $sacSignatureInformation->addChild('ds:Signature', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsSignature->addAttribute('Id', 'signature');
+
+        $dsSignedInfo = $dsSignature->addChild('ds:SignedInfo', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsSignedInfo->addChild('ds:CanonicalizationMethod', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2006/12/xml-c14n11');
+        $dsSignedInfo->addChild('ds:SignatureMethod', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256');
+
+        $dsReference1 = $dsSignedInfo->addChild('ds:Reference', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsReference1->addAttribute('Id', 'invoiceSignedData');
+        $dsReference1->addAttribute('URI', '');
+
+        $dsTransforms1 = $dsReference1->addChild('ds:Transforms', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsTransform1 = $dsTransforms1->addChild('ds:Transform', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsTransform1->addAttribute('Algorithm', 'http://www.w3.org/TR/1999/REC-xpath-19991116');
+        $dsTransform1->addChild('ds:XPath', 'not(//ancestor-or-self::ext:UBLExtensions)', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsTransform2 = $dsTransforms1->addChild('ds:Transform', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsTransform2->addAttribute('Algorithm', 'http://www.w3.org/TR/1999/REC-xpath-19991116');
+        $dsTransform2->addChild('ds:XPath', 'not(//ancestor-or-self::cac:Signature)', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsTransform3 = $dsTransforms1->addChild('ds:Transform', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsTransform3->addAttribute('Algorithm', 'http://www.w3.org/TR/1999/REC-xpath-19991116');
+        $dsTransform3->addChild('ds:XPath', 'not(//ancestor-or-self::cac:AdditionalDocumentReference[cbc:ID=\'QR\'])', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsTransforms1->addChild('ds:Transform', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2006/12/xml-c14n11');
+
+        $dsReference1->addChild('ds:DigestMethod', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2001/04/xmlenc#sha256');
+        $dsReference1->addChild('ds:DigestValue', 'f+0WCqnPkInI+eL9G3LAry12fTPf+toC9UX07F4fI+s=', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsReference2 = $dsSignedInfo->addChild('ds:Reference', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsReference2->addAttribute('Type', 'http://www.w3.org/2000/09/xmldsig#SignatureProperties');
+        $dsReference2->addAttribute('URI', '#xadesSignedProperties');
+
+        $dsReference2->addChild('ds:DigestMethod', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2001/04/xmlenc#sha256');
+        $dsReference2->addChild('ds:DigestValue', 'ODQwNTg1NTBhMjMzM2YxY2ZkZjVkYzdlNTZiZjY0ODJjMjNkYWI4MTUzNjdmNDVjMjAwZTBjODc2YTNhMWQ1Ng==', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsSignature->addChild('ds:SignatureValue', 'MEUCIBxyR8rc4K8728wdSF4XSDqPs+rIL+3TFh9m+aNxQPtSAiEA6cHapItvp13yMSu66NbOg2CpomHwUSnYJ9h6uGQ65aY=', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsKeyInfo = $dsSignature->addChild('ds:KeyInfo', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsX509Data = $dsKeyInfo->addChild('ds:X509Data', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsX509Data->addChild('ds:X509Certificate', 'MIID3jCCA4SgAwIBAgITEQAAOAPF90Ajs/xcXwABAAA4AzAKBggqhkjOPQQDAjBiMRUwEwYKCZImiZPyLGQBGRYFbG9jYWwxEzARBgoJkiaJk/IsZAEZFgNnb3YxFzAVBgoJkiaJk/IsZAEZFgdleHRnYXp0MRswGQYDVQQDExJQUlpFSU5WT0lDRVNDQTQtQ0EwHhcNMjQwMTExMDkxOTMwWhcNMjkwMTA5MDkxOTMwWjB1MQswCQYDVQQGEwJTQTEmMCQGA1UEChMdTWF4aW11bSBTcGVlZCBUZWNoIFN1cHBseSBMVEQxFjAUBgNVBAsTDVJpeWFkaCBCcmFuY2gxJjAkBgNVBAMTHVRTVC04ODY0MzExNDUtMzk5OTk5OTk5OTAwMDAzMFYwEAYHKoZIzj0CAQYFK4EEAAoDQgAEoWCKa0Sa9FIErTOv0uAkC1VIKXxU9nPpx2vlf4yhMejy8c02XJblDq7tPydo8mq0ahOMmNo8gwni7Xt1KT9UeKOCAgcwggIDMIGtBgNVHREEgaUwgaKkgZ8wgZwxOzA5BgNVBAQMMjEtVFNUfDItVFNUfDMtZWQyMmYxZDgtZTZhMi0xMTE4LTliNTgtZDlhOGYxMWU0NDVmMR8wHQYKCZImiZPyLGQBAQwPMzk5OTk5OTk5OTAwMDAzMQ0wCwYDVQQMDAQxMTAwMREwDwYDVQQaDAhSUlJEMjkyOTEaMBgGA1UEDwwRU3VwcGx5IGFjdGl2aXRpZXMwHQYDVR0OBBYEFEX+YvmmtnYoDf9BGbKo7ocTKYK1MB8GA1UdIwQYMBaAFJvKqqLtmqwskIFzVvpP2PxT+9NnMHsGCCsGAQUFBwEBBG8wbTBrBggrBgEFBQcwAoZfaHR0cDovL2FpYTQuemF0Y2EuZ292LnNhL0NlcnRFbnJvbGwvUFJaRUludm9pY2VTQ0E0LmV4dGdhenQuZ292LmxvY2FsX1BSWkVJTlZPSUNFU0NBNC1DQSgxKS5jcnQwDgYDVR0PAQH/BAQDAgeAMDwGCSsGAQQBgjcVBwQvMC0GJSsGAQQBgjcVCIGGqB2E0PsShu2dJIfO+xnTwFVmh/qlZYXZhD4CAWQCARIwHQYDVR0lBBYwFAYIKwYBBQUHAwMGCCsGAQUFBwMCMCcGCSsGAQQBgjcVCgQaMBgwCgYIKwYBBQUHAwMwCgYIKwYBBQUHAwIwCgYIKoZIzj0EAwIDSAAwRQIhALE/ichmnWXCUKUbca3yci8oqwaLvFdHVjQrveI9uqAbAiA9hC4M8jgMBADPSzmd2uiPJA6gKR3LE03U75eqbC/rXA==', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsObject = $dsSignature->addChild('ds:Object', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $xadesQualifyingProperties = $dsObject->addChild('xades:QualifyingProperties', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesQualifyingProperties->addAttribute('Target', 'signature');
+
+        $xadesSignedProperties = $xadesQualifyingProperties->addChild('xades:SignedProperties', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesSignedProperties->addAttribute('Id', 'xadesSignedProperties');
+
+        $xadesSignedSignatureProperties = $xadesSignedProperties->addChild('xades:SignedSignatureProperties', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesSignedSignatureProperties->addChild('xades:SigningTime', '2024-01-14T10:21:40', 'http://uri.etsi.org/01903/v1.3.2#');
+
+        $xadesSigningCertificate = $xadesSignedSignatureProperties->addChild('xades:SigningCertificate', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesCert = $xadesSigningCertificate->addChild('xades:Cert', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesCertDigest = $xadesCert->addChild('xades:CertDigest', '', 'http://uri.etsi.org/01903/v1.3.2#');
+
+        $xadesCertDigest->addChild('ds:DigestMethod', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2001/04/xmlenc#sha256');
+        $xadesCertDigest->addChild('ds:DigestValue', 'ZDMwMmI0MTE1NzVjOTU2NTk4YzVlODhhYmI0ODU2NDUyNTU2YTVhYjhhMDFmN2FjYjk1YTA2OWQ0NjY2MjQ4NQ==', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $xadesIssuerSerial = $xadesCert->addChild('xades:IssuerSerial', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesIssuerSerial->addChild('ds:X509IssuerName', 'CN=PRZEINVOICESCA4-CA, DC=extgazt, DC=gov, DC=local', 'http://www.w3.org/2000/09/xmldsig#');
+        $xadesIssuerSerial->addChild('ds:X509SerialNumber', '379112742831380471835263969587287663520528387', 'http://www.w3.org/2000/09/xmldsig#');
+    }
+
+    private function addInvoiceDetails($xml)
+    {
+        $xml->addChild('cbc:ProfileID', 'reporting:1.0', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:ID', 'SME00023', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:UUID', '8d487816-70b8-4ade-a618-9d620b73814a', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:IssueDate', '2022-09-07', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:IssueTime', '12:21:28', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:InvoiceTypeCode', '388', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('name', '0100000');
+        $xml->addChild('cbc:DocumentCurrencyCode', 'SAR', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:TaxCurrencyCode', 'SAR', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+
+    private function addAdditionalDocumentReferences($xml)
+    {
+        $additionalDocumentReference1 = $xml->addChild('cac:AdditionalDocumentReference', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $additionalDocumentReference1->addChild('cbc:ID', 'ICV', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $additionalDocumentReference1->addChild('cbc:UUID', '23', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $additionalDocumentReference2 = $xml->addChild('cac:AdditionalDocumentReference', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $additionalDocumentReference2->addChild('cbc:ID', 'PIH', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacAttachment2 = $additionalDocumentReference2->addChild('cac:Attachment', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacAttachment2->addChild('cbc:EmbeddedDocumentBinaryObject', 'NWZlY2ViNjZmZmM4NmYzOGQ5NTI3ODZjNmQ2OTZjNzljMmRiYzIzOWRkNGU5MWI0NjcyOWQ3M2EyN2ZiNTdlOQ==', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('mimeCode', 'text/plain');
+
+        $additionalDocumentReference3 = $xml->addChild('cac:AdditionalDocumentReference', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $additionalDocumentReference3->addChild('cbc:ID', 'QR', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacAttachment3 = $additionalDocumentReference3->addChild('cac:Attachment', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacAttachment3->addChild('cbc:EmbeddedDocumentBinaryObject', 'AW/YtNix2YPYqSDYqtmI2LHZitivINin2YTYqtmD2YbZiNmE2YjYrNmK2Kcg2KjYo9mC2LXZiSDYs9ix2LnYqSDYp9mE2YXYrdiv2YjYr9ipIHwgTWF4aW11bSBTcGVlZCBUZWNoIFN1cHBseSBMVEQCDzM5OTk5OTk5OTkwMDAwMwMTMjAyMi0wOS0wN1QxMjoyMToyOAQENC42MAUDMC42BixmKzBXQ3FuUGtJbkkrZUw5RzNMQXJ5MTJmVFBmK3RvQzlVWDA3RjRmSStzPQdgTUVVQ0lCeHlSOHJjNEs4NzI4d2RTRjRYU0RxUHMrcklMKzNURmg5bSthTnhRUHRTQWlFQTZjSGFwSXR2cDEzeU1TdTY2TmJPZzJDcG9tSHdVU25ZSjloNnVHUTY1YVk9CFgwVjAQBgcqhkjOPQIBBgUrgQQACgNCAAShYIprRJr0UgStM6/S4CQLVUgpfFT2c+nHa+V/jKEx6PLxzTZcluUOru0/J2jyarRqE4yY2jyDCeLte3UpP1R4', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('mimeCode', 'text/plain');
+    }
+    private function addSignature($xml)
+    {
+        $cacSignature = $xml->addChild('cac:Signature', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacSignature->addChild('cbc:ID', 'urn:oasis:names:specification:ubl:signature:Invoice', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacSignature->addChild('cbc:SignatureMethod', 'urn:oasis:names:specification:ubl:dsig:enveloped:xades', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+
+    private function addAccountingSupplierParty($xml)
+    {
+        $cacAccountingSupplierParty = $xml->addChild('cac:AccountingSupplierParty', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPartySupplier = $cacAccountingSupplierParty->addChild('cac:Party', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPartySupplier->addChild('cac:PartyIdentification', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2')->addChild('cbc:ID', '1010010000', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('schemeID', 'CRN');
+
+        $cacPostalAddressSupplier = $cacPartySupplier->addChild('cac:PostalAddress', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPostalAddressSupplier->addChild('cbc:StreetName', 'الامير سلطان | Prince Sultan', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacPostalAddressSupplier->addChild('cbc:BuildingNumber', '2322', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacPostalAddressSupplier->addChild('cbc:CitySubdivisionName', 'المربع | Al-Murabba', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacPostalAddressSupplier->addChild('cbc:CityName', 'الرياض | Riyadh', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacPostalAddressSupplier->addChild('cbc:PostalZone', '23333', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacCountrySupplier = $cacPostalAddressSupplier->addChild('cac:Country', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacCountrySupplier->addChild('cbc:IdentificationCode', 'SA', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacPartyTaxSchemeSupplier = $cacPartySupplier->addChild('cac:PartyTaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPartyTaxSchemeSupplier->addChild('cbc:CompanyID', '399999999900003', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacTaxSchemeSupplier = $cacPartyTaxSchemeSupplier->addChild('cac:TaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacTaxSchemeSupplier->addChild('cbc:ID', 'VAT', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacPartyLegalEntitySupplier = $cacPartySupplier->addChild('cac:PartyLegalEntity', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPartyLegalEntitySupplier->addChild('cbc:RegistrationName', 'شركة توريد التكنولوجيا بأقصى سرعة المحدودة | Maximum Speed Tech Supply LTD', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+    private function addAccountingCustomerParty($xml)
+    {
+        $cacAccountingCustomerParty = $xml->addChild('cac:AccountingCustomerParty', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPartyCustomer = $cacAccountingCustomerParty->addChild('cac:Party', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+
+        $cacPostalAddressCustomer = $cacPartyCustomer->addChild('cac:PostalAddress', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPostalAddressCustomer->addChild('cbc:StreetName', 'صلاح الدين | Salah Al-Din', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacPostalAddressCustomer->addChild('cbc:BuildingNumber', '1111', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacPostalAddressCustomer->addChild('cbc:CitySubdivisionName', 'المروج | Al-Murooj', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacPostalAddressCustomer->addChild('cbc:CityName', 'الرياض | Riyadh', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacPostalAddressCustomer->addChild('cbc:PostalZone', '12222', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacCountryCustomer = $cacPostalAddressCustomer->addChild('cac:Country', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacCountryCustomer->addChild('cbc:IdentificationCode', 'SA', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacPartyTaxSchemeCustomer = $cacPartyCustomer->addChild('cac:PartyTaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPartyTaxSchemeCustomer->addChild('cbc:CompanyID', '399999999800003', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacTaxSchemeCustomer = $cacPartyTaxSchemeCustomer->addChild('cac:TaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacTaxSchemeCustomer->addChild('cbc:ID', 'VAT', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacPartyLegalEntityCustomer = $cacPartyCustomer->addChild('cac:PartyLegalEntity', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPartyLegalEntityCustomer->addChild('cbc:RegistrationName', 'شركة نماذج فاتورة المحدودة | Fatoora Samples LTD', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+
+    private function addPaymentMeans($xml)
+    {
+        $cacPaymentMeans = $xml->addChild('cac:PaymentMeans', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPaymentMeans->addChild('cbc:PaymentMeansCode', '10', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+
+    private function addAllowanceCharge($xml)
+    {
+        $cacAllowanceCharge = $xml->addChild('cac:AllowanceCharge', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacAllowanceCharge->addChild('cbc:ChargeIndicator', 'false', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacAllowanceCharge->addChild('cbc:AllowanceChargeReason', 'discount', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacAllowanceCharge->addChild('cbc:Amount', '0.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $cacTaxCategory = $cacAllowanceCharge->addChild('cac:TaxCategory', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cbcID = $cacTaxCategory->addChild('cbc:ID', 'S', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cbcID->addAttribute('schemeID', 'UN/ECE 5305');
+        $cbcID->addAttribute('schemeAgencyID', '6');
+        $cacTaxCategory->addChild('cbc:Percent', '15', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacTaxScheme = $cacTaxCategory->addChild('cac:TaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cbcTaxSchemeID = $cacTaxScheme->addChild('cbc:ID', 'VAT', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cbcTaxSchemeID->addAttribute('schemeID', 'UN/ECE 5153');
+        $cbcTaxSchemeID->addAttribute('schemeAgencyID', '6');
+    }
+
+    private function addTaxTotal($xml)
+    {
+        $cacTaxTotal = $xml->addChild('cac:TaxTotal', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacTaxTotal->addChild('cbc:TaxAmount', '0.6', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $cacTaxSubtotal = $cacTaxTotal->addChild('cac:TaxSubtotal', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacTaxSubtotal->addChild('cbc:TaxableAmount', '4.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $cacTaxSubtotal->addChild('cbc:TaxAmount', '0.60', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $cacTaxCategory2 = $cacTaxSubtotal->addChild('cac:TaxCategory', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cbcID = $cacTaxCategory2->addChild('cbc:ID', 'S', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cbcID->addAttribute('schemeID', 'UN/ECE 5305');
+        $cbcID->addAttribute('schemeAgencyID', '6');
+        $cacTaxCategory2->addChild('cbc:Percent', '15.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacTaxScheme2 = $cacTaxCategory2->addChild('cac:TaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cbcTaxSchemeID = $cacTaxScheme2->addChild('cbc:ID', 'VAT', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cbcTaxSchemeID->addAttribute('schemeID', 'UN/ECE 5153');
+        $cbcTaxSchemeID->addAttribute('schemeAgencyID', '6');
+    }
+    private function addLegalMonetaryTotal($xml)
+    {
+        $cacLegalMonetaryTotal = $xml->addChild('cac:LegalMonetaryTotal', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacLegalMonetaryTotal->addChild('cbc:LineExtensionAmount', '4.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $cacLegalMonetaryTotal->addChild('cbc:TaxExclusiveAmount', '4.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $cacLegalMonetaryTotal->addChild('cbc:TaxInclusiveAmount', '4.60', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $cacLegalMonetaryTotal->addChild('cbc:AllowanceTotalAmount', '0.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $cacLegalMonetaryTotal->addChild('cbc:PrepaidAmount', '0.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $cacLegalMonetaryTotal->addChild('cbc:PayableAmount', '4.60', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+    }
+    private function addInvoiceLine($xml)
+    {
+        $cacInvoiceLine = $xml->addChild('cac:InvoiceLine', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacInvoiceLine->addChild('cbc:ID', '1', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacInvoiceLine->addChild('cbc:InvoicedQuantity', '2.000000', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('unitCode', 'PCE');
+        $cacInvoiceLine->addChild('cbc:LineExtensionAmount', '4.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $cacTaxTotalLine = $cacInvoiceLine->addChild('cac:TaxTotal', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacTaxTotalLine->addChild('cbc:TaxAmount', '0.60', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $cacTaxTotalLine->addChild('cbc:RoundingAmount', '4.60', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $cacItem = $cacInvoiceLine->addChild('cac:Item', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacItem->addChild('cbc:Name', 'قلم رصاص', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacClassifiedTaxCategory = $cacItem->addChild('cac:ClassifiedTaxCategory', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacClassifiedTaxCategory->addChild('cbc:ID', 'S', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacClassifiedTaxCategory->addChild('cbc:Percent', '15.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacTaxScheme3 = $cacClassifiedTaxCategory->addChild('cac:TaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacTaxScheme3->addChild('cbc:ID', 'VAT', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $cacPrice = $cacInvoiceLine->addChild('cac:Price', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacPrice->addChild('cbc:PriceAmount', '2.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $cacAllowanceChargePrice = $cacPrice->addChild('cac:AllowanceCharge', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacAllowanceChargePrice->addChild('cbc:ChargeIndicator', 'true', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacAllowanceChargePrice->addChild('cbc:AllowanceChargeReason', 'discount', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cacAllowanceChargePrice->addChild('cbc:Amount', '0.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+    }
+    private function addDelivery($xml)
+    {
+        $cacDelivery = $xml->addChild('cac:Delivery', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cacDelivery->addChild('cbc:ActualDeliveryDate', '2022-09-07', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+
+*/
+
+
+    public function generateInvoiceXML()
+    {
+        $xml = $this->createRootElement();
+        $this->addUBLExtensions($xml);
+        $this->addInvoiceDetails($xml);
+        $this->addAdditionalDocumentReferences($xml);
+        $this->addSignature($xml);
+        $this->addAccountingSupplierParty($xml);
+        $this->addAccountingCustomerParty($xml);
+        $this->addDelivery($xml);
+        $this->addPaymentMeans($xml);
+        $this->addAllowanceCharge($xml);
+        $this->addTaxTotal($xml);
+        $this->addLegalMonetaryTotal($xml);
+        $this->addInvoiceLine($xml);
+
+        $filePath = public_path('invoices/invoice.xml');
+        $xmlContent = $xml->asXML();
+
+        if (!file_exists(public_path('invoices'))) {
+            mkdir(public_path('invoices'), 0777, true);
+        }
+
+        file_put_contents($filePath, $xmlContent);
+
+        return response()->download($filePath);
+    }
+
+    private function createRootElement()
+    {
+        $xmlString = '<?xml version="1.0" encoding="UTF-8"?><Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2" xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2" xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2" xmlns:ext="urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2"></Invoice>';
+        $xml = new SimpleXMLElement($xmlString, 0, false, 'cbc', true);
+        return $xml;
+    }
+
+    private function addUBLExtensions($xml)
+    {
+        $extUBLExtensions = $xml->addChild('ext:UBLExtensions', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2');
+        $extUBLExtension = $extUBLExtensions->addChild('ext:UBLExtension', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2');
+        $extUBLExtension->addChild('ext:ExtensionURI', 'urn:oasis:names:specification:ubl:dsig:enveloped:xades', 'urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2');
+        $extExtensionContent = $extUBLExtension->addChild('ext:ExtensionContent', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2');
+
+        $sigUBLDocumentSignatures = $extExtensionContent->addChild('sig:UBLDocumentSignatures', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonSignatureComponents-2');
+        $sacSignatureInformation = $sigUBLDocumentSignatures->addChild('sac:SignatureInformation', '', 'urn:oasis:names:specification:ubl:schema:xsd:SignatureAggregateComponents-2');
+        $sacSignatureInformation->addChild('cbc:ID', 'urn:oasis:names:specification:ubl:signature:1', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $sacSignatureInformation->addChild('sbc:ReferencedSignatureID', 'urn:oasis:names:specification:ubl:signature:Invoice', 'urn:oasis:names:specification:ubl:schema:xsd:SignatureBasicComponents-2');
+
+        $dsSignature = $sacSignatureInformation->addChild('ds:Signature', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsSignature->addAttribute('Id', 'signature');
+
+        $dsSignedInfo = $dsSignature->addChild('ds:SignedInfo', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsSignedInfo->addChild('ds:CanonicalizationMethod', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2006/12/xml-c14n11');
+        $dsSignedInfo->addChild('ds:SignatureMethod', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256');
+
+        $dsReference1 = $dsSignedInfo->addChild('ds:Reference', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsReference1->addAttribute('Id', 'invoiceSignedData');
+        $dsReference1->addAttribute('URI', '');
+
+        $dsTransforms1 = $dsReference1->addChild('ds:Transforms', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsTransform1 = $dsTransforms1->addChild('ds:Transform', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsTransform1->addAttribute('Algorithm', 'http://www.w3.org/TR/1999/REC-xpath-19991116');
+        $dsTransform1->addChild('ds:XPath', 'not(//ancestor-or-self::ext:UBLExtensions)', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsTransform2 = $dsTransforms1->addChild('ds:Transform', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsTransform2->addAttribute('Algorithm', 'http://www.w3.org/TR/1999/REC-xpath-19991116');
+        $dsTransform2->addChild('ds:XPath', 'not(//ancestor-or-self::cac:Signature)', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsTransform3 = $dsTransforms1->addChild('ds:Transform', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsTransform3->addAttribute('Algorithm', 'http://www.w3.org/TR/1999/REC-xpath-19991116');
+        $dsTransform3->addChild('ds:XPath', 'not(//ancestor-or-self::cac:AdditionalDocumentReference[cbc:ID=\'QR\'])', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsTransforms1->addChild('ds:Transform', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2006/12/xml-c14n11');
+
+        $dsReference1->addChild('ds:DigestMethod', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2001/04/xmlenc#sha256');
+        $dsReference1->addChild('ds:DigestValue', 'f+0WCqnPkInI+eL9G3LAry12fTPf+toC9UX07F4fI+s=', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsReference2 = $dsSignedInfo->addChild('ds:Reference', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsReference2->addAttribute('Type', 'http://www.w3.org/2000/09/xmldsig#SignatureProperties');
+        $dsReference2->addAttribute('URI', '#xadesSignedProperties');
+
+        $dsReference2->addChild('ds:DigestMethod', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2001/04/xmlenc#sha256');
+        $dsReference2->addChild('ds:DigestValue', 'ODQwNTg1NTBhMjMzM2YxY2ZkZjVkYzdlNTZiZjY0ODJjMjNkYWI4MTUzNjdmNDVjMjAwZTBjODc2YTNhMWQ1Ng==', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsSignature->addChild('ds:SignatureValue', 'MEUCIBxyR8rc4K8728wdSF4XSDqPs+rIL+3TFh9m+aNxQPtSAiEA6cHapItvp13yMSu66NbOg2CpomHwUSnYJ9h6uGQ65aY=', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsKeyInfo = $dsSignature->addChild('ds:KeyInfo', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsX509Data = $dsKeyInfo->addChild('ds:X509Data', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $dsX509Data->addChild('ds:X509Certificate', 'MIID3jCCA4SgAwIBAgITEQAAOAPF90Ajs/xcXwABAAA4AzAKBggqhkjOPQQDAjBiMRUwEwYKCZImiZPyLGQBGRYFbG9jYWwxEzARBgoJkiaJk/IsZAEZFgNnb3YxFzAVBgoJkiaJk/IsZAEZFgdleHRnYXp0MRswGQYDVQQDExJQUlpFSU5WT0lDRVNDQTQtQ0EwHhcNMjQwMTExMDkxOTMwWhcNMjkwMTA5MDkxOTMwWjB1MQswCQYDVQQGEwJTQTEmMCQGA1UEChMdTWF4aW11bSBTcGVlZCBUZWNoIFN1cHBseSBMVEQxFjAUBgNVBAsTDVJpeWFkaCBCcmFuY2gxJjAkBgNVBAMTHVRTVC04ODY0MzExNDUtMzk5OTk5OTk5OTAwMDAzMFYwEAYHKoZIzj0CAQYFK4EEAAoDQgAEoWCKa0Sa9FIErTOv0uAkC1VIKXxU9nPpx2vlf4yhMejy8c02XJblDq7tPydo8mq0ahOMmNo8gwni7Xt1KT9UeKOCAgcwggIDMIGtBgNVHREEgaUwgaKkgZ8wgZwxOzA5BgNVBAQMMjEtVFNUfDItVFNUfDMtZWQyMmYxZDgtZTZhMi0xMTE4LTliNTgtZDlhOGYxMWU0NDVmMR8wHQYKCZImiZPyLGQBAQwPMzk5OTk5OTk5OTAwMDAzMQ0wCwYDVQQMDAQxMTAwMREwDwYDVQQaDAhSUlJEMjkyOTEaMBgGA1UEDwwRU3VwcGx5IGFjdGl2aXRpZXMwHQYDVR0OBBYEFEX+YvmmtnYoDf9BGbKo7ocTKYK1MB8GA1UdIwQYMBaAFJvKqqLtmqwskIFzVvpP2PxT+9NnMHsGCCsGAQUFBwEBBG8wbTBrBggrBgEFBQcwAoZfaHR0cDovL2FpYTQuemF0Y2EuZ292LnNhL0NlcnRFbnJvbGwvUFJaRUludm9pY2VTQ0E0LmV4dGdhenQuZ292LmxvY2FsX1BSWkVJTlZPSUNFU0NBNC1DQSgxKS5jcnQwDgYDVR0PAQH/BAQDAgeAMDwGCSsGAQQBgjcVBwQvMC0GJSsGAQQBgjcVCIGGqB2E0PsShu2dJIfO+xnTwFVmh/qlZYXZhD4CAWQCARIwHQYDVR0lBBYwFAYIKwYBBQUHAwMGCCsGAQUFBwMCMCcGCSsGAQQBgjcVCgQaMBgwCgYIKwYBBQUHAwMwCgYIKwYBBQUHAwIwCgYIKoZIzj0EAwIDSAAwRQIhALE/ichmnWXCUKUbca3yci8oqwaLvFdHVjQrveI9uqAbAiA9hC4M8jgMBADPSzmd2uiPJA6gKR3LE03U75eqbC/rXA==', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $dsObject = $dsSignature->addChild('ds:Object', '', 'http://www.w3.org/2000/09/xmldsig#');
+        $xadesQualifyingProperties = $dsObject->addChild('xades:QualifyingProperties', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesQualifyingProperties->addAttribute('Target', 'signature');
+
+        $xadesSignedProperties = $xadesQualifyingProperties->addChild('xades:SignedProperties', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesSignedProperties->addAttribute('Id', 'xadesSignedProperties');
+
+        $xadesSignedSignatureProperties = $xadesSignedProperties->addChild('xades:SignedSignatureProperties', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesSignedSignatureProperties->addChild('xades:SigningTime', '2024-01-14T10:21:40', 'http://uri.etsi.org/01903/v1.3.2#');
+
+        $xadesSigningCertificate = $xadesSignedSignatureProperties->addChild('xades:SigningCertificate', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesCert = $xadesSigningCertificate->addChild('xades:Cert', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesCertDigest = $xadesCert->addChild('xades:CertDigest', '', 'http://uri.etsi.org/01903/v1.3.2#');
+
+        $xadesCertDigest->addChild('ds:DigestMethod', '', 'http://www.w3.org/2000/09/xmldsig#')->addAttribute('Algorithm', 'http://www.w3.org/2001/04/xmlenc#sha256');
+        $xadesCertDigest->addChild('ds:DigestValue', 'ZDMwMmI0MTE1NzVjOTU2NTk4YzVlODhhYmI0ODU2NDUyNTU2YTVhYjhhMDFmN2FjYjk1YTA2OWQ0NjY2MjQ4NQ==', 'http://www.w3.org/2000/09/xmldsig#');
+
+        $xadesIssuerSerial = $xadesCert->addChild('xades:IssuerSerial', '', 'http://uri.etsi.org/01903/v1.3.2#');
+        $xadesIssuerSerial->addChild('ds:X509IssuerName', 'CN=PRZEINVOICESCA4-CA, DC=extgazt, DC=gov, DC=local', 'http://www.w3.org/2000/09/xmldsig#');
+        $xadesIssuerSerial->addChild('ds:X509SerialNumber', '379112742831380471835263969587287663520528387', 'http://www.w3.org/2000/09/xmldsig#');
+    }
+
+    private function addInvoiceDetails($xml)
+    {
+        $xml->addChild('cbc:ProfileID', 'reporting:1.0', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:ID', 'SME00023', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:UUID', '8d487816-70b8-4ade-a618-9d620b73814a', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:IssueDate', '2022-09-07', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:IssueTime', '12:21:28', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:InvoiceTypeCode', '388', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('name', '0100000');
+        $xml->addChild('cbc:DocumentCurrencyCode', 'SAR', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $xml->addChild('cbc:TaxCurrencyCode', 'SAR', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+
+    private function addAdditionalDocumentReferences($xml)
+    {
+        $additionalDocumentReference1 = $xml->addChild('cac:AdditionalDocumentReference', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $additionalDocumentReference1->addChild('cbc:ID', 'ICV', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $additionalDocumentReference1->addChild('cbc:UUID', '23', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $additionalDocumentReference2 = $xml->addChild('cac:AdditionalDocumentReference', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $additionalDocumentReference2->addChild('cbc:ID', 'PIH', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $attachment2 = $additionalDocumentReference2->addChild('cac:Attachment', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $attachment2->addChild('cbc:EmbeddedDocumentBinaryObject', 'NWZlY2ViNjZmZmM4NmYzOGQ5NTI3ODZjNmQ2OTZjNzljMmRiYzIzOWRkNGU5MWI0NjcyOWQ3M2EyN2ZiNTdlOQ==', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('mimeCode', 'text/plain');
+
+        $additionalDocumentReference3 = $xml->addChild('cac:AdditionalDocumentReference', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $additionalDocumentReference3->addChild('cbc:ID', 'QR', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $attachment3 = $additionalDocumentReference3->addChild('cac:Attachment', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $attachment3->addChild('cbc:EmbeddedDocumentBinaryObject', 'AW/YtNix2YPYqSDYqtmI2LHZitivINin2YTYqtmD2YbZiNmE2YjYrNmK2Kcg2KjYo9mC2LXZiSDYs9ix2LnYqSDYp9mE2YXYrdiv2YjYr9ipIHwgTWF4aW11bSBTcGVlZCBUZWNoIFN1cHBseSBMVEQCDzM5OTk5OTk5OTkwMDAwMwMTMjAyMi0wOS0wN1QxMjoyMToyOAQENC42MAUDMC42BixmKzBXQ3FuUGtJbkkrZUw5RzNMQXJ5MTJmVFBmK3RvQzlVWDA3RjRmSStzPQdgTUVVQ0lCeHlSOHJjNEs4NzI4d2RTRjRYU0RxUHMrcklMKzNURmg5bSthTnhRUHRTQWlFQTZjSGFwSXR2cDEzeU1TdTY2TmJPZzJDcG9tSHdVU25ZSjloNnVHUTY1YVk9CFgwVjAQBgcqhkjOPQIBBgUrgQQACgNCAAShYIprRJr0UgStM6/S4CQLVUgpfFT2c+nHa+V/jKEx6PLxzTZcluUOru0/J2jyarRqE4yY2jyDCeLte3UpP1R4', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('mimeCode', 'text/plain');
+    }
+
+    private function addSignature($xml)
+    {
+        $signature = $xml->addChild('cac:Signature', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $signature->addChild('cbc:ID', 'urn:oasis:names:specification:ubl:signature:Invoice', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $signature->addChild('cbc:SignatureMethod', 'urn:oasis:names:specification:ubl:dsig:enveloped:xades', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+
+    private function addAccountingSupplierParty($xml)
+    {
+        $accountingSupplierParty = $xml->addChild('cac:AccountingSupplierParty', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $party = $accountingSupplierParty->addChild('cac:Party', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+
+        $partyIdentification = $party->addChild('cac:PartyIdentification', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $partyIdentification->addChild('cbc:ID', '1010010000', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('schemeID', 'CRN');
+
+        $postalAddress = $party->addChild('cac:PostalAddress', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $postalAddress->addChild('cbc:StreetName', 'الامير سلطان | Prince Sultan', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $postalAddress->addChild('cbc:BuildingNumber', '2322', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $postalAddress->addChild('cbc:CitySubdivisionName', 'المربع | Al-Murabba', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $postalAddress->addChild('cbc:CityName', 'الرياض | Riyadh', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $postalAddress->addChild('cbc:PostalZone', '23333', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $country = $postalAddress->addChild('cac:Country', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $country->addChild('cbc:IdentificationCode', 'SA', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $partyTaxScheme = $party->addChild('cac:PartyTaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $partyTaxScheme->addChild('cbc:CompanyID', '399999999900003', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $taxScheme = $partyTaxScheme->addChild('cac:TaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $taxScheme->addChild('cbc:ID', 'VAT', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $partyLegalEntity = $party->addChild('cac:PartyLegalEntity', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $partyLegalEntity->addChild('cbc:RegistrationName', 'شركة توريد التكنولوجيا بأقصى سرعة المحدودة | Maximum Speed Tech Supply LTD', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+
+    private function addAccountingCustomerParty($xml)
+    {
+        $accountingCustomerParty = $xml->addChild('cac:AccountingCustomerParty', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $party = $accountingCustomerParty->addChild('cac:Party', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+
+        $postalAddress = $party->addChild('cac:PostalAddress', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $postalAddress->addChild('cbc:StreetName', 'صلاح الدين | Salah Al-Din', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $postalAddress->addChild('cbc:BuildingNumber', '1111', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $postalAddress->addChild('cbc:CitySubdivisionName', 'المروج | Al-Murooj', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $postalAddress->addChild('cbc:CityName', 'الرياض | Riyadh', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $postalAddress->addChild('cbc:PostalZone', '12222', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $country = $postalAddress->addChild('cac:Country', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $country->addChild('cbc:IdentificationCode', 'SA', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $partyTaxScheme = $party->addChild('cac:PartyTaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $partyTaxScheme->addChild('cbc:CompanyID', '399999999800003', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $taxScheme = $partyTaxScheme->addChild('cac:TaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $taxScheme->addChild('cbc:ID', 'VAT', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $partyLegalEntity = $party->addChild('cac:PartyLegalEntity', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $partyLegalEntity->addChild('cbc:RegistrationName', 'شركة نماذج فاتورة المحدودة | Fatoora Samples LTD', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+
+    private function addDelivery($xml)
+    {
+        $delivery = $xml->addChild('cac:Delivery', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $delivery->addChild('cbc:ActualDeliveryDate', '2022-09-07', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+
+    private function addPaymentMeans($xml)
+    {
+        $paymentMeans = $xml->addChild('cac:PaymentMeans', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $paymentMeans->addChild('cbc:PaymentMeansCode', '10', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+    }
+
+    private function addAllowanceCharge($xml)
+    {
+        $allowanceCharge = $xml->addChild('cac:AllowanceCharge', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $allowanceCharge->addChild('cbc:ChargeIndicator', 'false', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $allowanceCharge->addChild('cbc:AllowanceChargeReason', 'discount', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $allowanceCharge->addChild('cbc:Amount', '0.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $taxCategory = $allowanceCharge->addChild('cac:TaxCategory', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cbcID = $taxCategory->addChild('cbc:ID', 'S', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cbcID->addAttribute('schemeID', 'UN/ECE 5305');
+        $cbcID->addAttribute('schemeAgencyID', '6');
+        $taxCategory->addChild('cbc:Percent', '15', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $taxScheme = $taxCategory->addChild('cac:TaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cbcTaxSchemeID = $taxScheme->addChild('cbc:ID', 'VAT', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cbcTaxSchemeID->addAttribute('schemeID', 'UN/ECE 5153');
+        $cbcTaxSchemeID->addAttribute('schemeAgencyID', '6');
+    }
+
+
+    private function addTaxTotal($xml)
+    {
+        $taxTotal = $xml->addChild('cac:TaxTotal', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $taxTotal->addChild('cbc:TaxAmount', '0.6', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $taxSubtotal = $taxTotal->addChild('cac:TaxSubtotal', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $taxSubtotal->addChild('cbc:TaxableAmount', '4.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $taxSubtotal->addChild('cbc:TaxAmount', '0.60', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $taxCategory = $taxSubtotal->addChild('cac:TaxCategory', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cbcID = $taxCategory->addChild('cbc:ID', 'S', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cbcID->addAttribute('schemeID', 'UN/ECE 5305');
+        $cbcID->addAttribute('schemeAgencyID', '6');
+        $taxCategory->addChild('cbc:Percent', '15.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $taxScheme = $taxCategory->addChild('cac:TaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $cbcTaxSchemeID = $taxScheme->addChild('cbc:ID', 'VAT', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $cbcTaxSchemeID->addAttribute('schemeID', 'UN/ECE 5153');
+        $cbcTaxSchemeID->addAttribute('schemeAgencyID', '6');
+    }
+
+
+    private function addLegalMonetaryTotal($xml)
+    {
+        $legalMonetaryTotal = $xml->addChild('cac:LegalMonetaryTotal', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $legalMonetaryTotal->addChild('cbc:LineExtensionAmount', '4.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $legalMonetaryTotal->addChild('cbc:TaxExclusiveAmount', '4.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $legalMonetaryTotal->addChild('cbc:TaxInclusiveAmount', '4.60', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $legalMonetaryTotal->addChild('cbc:AllowanceTotalAmount', '0.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $legalMonetaryTotal->addChild('cbc:PrepaidAmount', '0.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $legalMonetaryTotal->addChild('cbc:PayableAmount', '4.60', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+    }
+
+    private function addInvoiceLine($xml)
+    {
+        $invoiceLine = $xml->addChild('cac:InvoiceLine', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $invoiceLine->addChild('cbc:ID', '1', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $invoiceLine->addChild('cbc:InvoicedQuantity', '2.000000', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('unitCode', 'PCE');
+        $invoiceLine->addChild('cbc:LineExtensionAmount', '4.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $taxTotal = $invoiceLine->addChild('cac:TaxTotal', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $taxTotal->addChild('cbc:TaxAmount', '0.60', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+        $taxTotal->addChild('cbc:RoundingAmount', '4.60', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $item = $invoiceLine->addChild('cac:Item', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $item->addChild('cbc:Name', 'قلم رصاص', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $classifiedTaxCategory = $item->addChild('cac:ClassifiedTaxCategory', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $classifiedTaxCategory->addChild('cbc:ID', 'S', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $classifiedTaxCategory->addChild('cbc:Percent', '15.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $taxScheme = $classifiedTaxCategory->addChild('cac:TaxScheme', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $taxScheme->addChild('cbc:ID', 'VAT', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        $price = $invoiceLine->addChild('cac:Price', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $price->addChild('cbc:PriceAmount', '2.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+
+        $allowanceCharge = $price->addChild('cac:AllowanceCharge', '', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $allowanceCharge->addChild('cbc:ChargeIndicator', 'true', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $allowanceCharge->addChild('cbc:AllowanceChargeReason', 'discount', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+        $allowanceCharge->addChild('cbc:Amount', '0.00', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2')->addAttribute('currencyID', 'SAR');
+    }
+
+
+
 
     /**
      * Returns the content for the receipt
@@ -780,7 +1667,7 @@ class SellPosController extends Controller
             $output['html_content'] = view($layout, compact('receipt_details'))->render();
         }
 
-       
+
         return $output;
     }
 
